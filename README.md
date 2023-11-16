@@ -1,5 +1,5 @@
 # pydos
-
+Plot DOS from PROCAR output in VASP.
 # Description
 Based on pydos developed by Qijing Zheng.
 <br>This program is edited to export DOS data in csv format (pydos_csv.py) and plot it (pydos_plot.py).
