@@ -81,4 +81,11 @@ legend_names = {
 
 ![dos_example](Example/pdos.png)
 
+It might be a good idea to change the code to something like this, and to table the PDOS on the dotted line.
 
+```
+            if 'PDOS 1' in col:
+                plt.plot(shifted_energy.to_numpy(), df[col].to_numpy() * pdos1_scale_factor,
+                 label=label_name if '(Spin 2)' not in col else '', color=color, alpha=0.8, linestyle='--')
+```
+![dos_example_dot](Example/pdos_dot.png)
