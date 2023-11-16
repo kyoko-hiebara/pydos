@@ -31,8 +31,8 @@ def plot_custom_color_pdos(df, Efermi, pdos1_scale_factor, x_range, y_range, col
     # Shift energy by Efermi
     shifted_energy = df['Energy'] - Efermi
 
-    # Plotting each DOS component
-    for col in df.columns[1:]:  # Skip the Energy column
+
+    for col in df.columns[1:]: 
         base_name = col.split(' (')[0]
 
         if base_name in color_settings:
