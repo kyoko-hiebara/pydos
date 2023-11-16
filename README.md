@@ -79,6 +79,6 @@ legend_names = {
 }
 ```
 
-![dos_example](
+![dos_example](Example/pdos.png)
 
 
