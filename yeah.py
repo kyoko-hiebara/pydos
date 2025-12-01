@@ -112,7 +112,7 @@ def main():
     print(f"\nLoading MACE-OMAT-0 model on {device}...")
     
     calculator = MACECalculator(
-        model_path="mace-medium-omat-0.model",
+        model_path="mace-omat-0-medium.model",
         device=device,
         default_dtype="float64"
     )
