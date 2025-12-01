@@ -11,7 +11,7 @@ from ase.build import bulk
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
 from ase import units
-from mace.calculators import mace_omat
+from mace.calculators import MACECalculator
 import torch
 
 def create_si_supercell(target_atoms: int) -> Atoms:
@@ -111,7 +111,7 @@ def main():
     
     print(f"\nLoading MACE-OMAT-0 model on {device}...")
     
-    calculator = mace_omat(
+    calculator = MACECalculator(
         model_path="mace-medium-omat-0.model",
         device=device,
         default_dtype="float64"
