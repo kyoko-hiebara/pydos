@@ -98,7 +98,7 @@ def main():
 
     
     calculator = MACECalculator(
-        models="medium-omat-0",
+        model_path="medium-omat-0",
         device=device,
         default_dtype="float64"
     )
