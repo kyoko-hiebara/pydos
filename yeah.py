@@ -53,7 +53,7 @@ def create_si_supercell(target_atoms: int) -> Atoms:
     Si diamond構造: 単位胞あたり8原子
     8の倍数でない場合は最も近い8の倍数に調整
     """
-    si_unit = bulk('Si', 'diamond', a=5.43)
+    si_unit = bulk('Si', 'diamond', a=5.43, cubic=True)  # cubic=True で8原子のconventional cell
     
     # 8の倍数でない場合は調整
     if target_atoms % 8 != 0:
