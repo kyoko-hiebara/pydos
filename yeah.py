@@ -1,6 +1,6 @@
 """
 MACE-OMAT-0 Foundation Model を使った Si 原子の MD ベンチマーク
-原子数: 100, 1000, 10000, 20000, 30000, 40000, 50000
+原子数: 96, 1000, 10000, 20000, 30000, 40000, 50000
 MD steps: 200
 """
 
@@ -14,44 +14,59 @@ from ase import units
 from mace.calculators import MACECalculator
 import torch
 
+
+def factorize_for_supercell(n_cells: int) -> tuple:
+    """
+    n_cells を nx * ny * nz に因数分解
+    できるだけバランスよく3つに分ける
+    """
+    # 素因数分解
+    factors = []
+    n = n_cells
+    d = 2
+    while d * d <= n:
+        while n % d == 0:
+            factors.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)
+    
+    # 3つのグループにバランスよく分ける（大きい因数から割り当て）
+    nx, ny, nz = 1, 1, 1
+    factors.sort(reverse=True)
+    for f in factors:
+        # 最小のものに掛ける
+        if nx <= ny and nx <= nz:
+            nx *= f
+        elif ny <= nz:
+            ny *= f
+        else:
+            nz *= f
+    
+    return (nx, ny, nz)
+
+
 def create_si_supercell(target_atoms: int) -> Atoms:
     """
-    指定した原子数に近いSi supercellを作成
+    指定した原子数のSi supercellを作成
     Si diamond構造: 単位胞あたり8原子
+    8の倍数でない場合は最も近い8の倍数に調整
     """
     si_unit = bulk('Si', 'diamond', a=5.43)
     
-    # 必要な単位胞数
-    n_cells_needed = target_atoms / 8
+    # 8の倍数でない場合は調整
+    if target_atoms % 8 != 0:
+        adjusted = round(target_atoms / 8) * 8
+        if adjusted == 0:
+            adjusted = 8
+        print(f"  Note: {target_atoms} is not a multiple of 8. Adjusted to {adjusted} atoms.")
+        target_atoms = adjusted
     
-    # 立方体に近い形で探索（探索範囲を十分に広げる）
-    n_max = int(np.ceil(n_cells_needed ** (1/3))) + 10
+    n_cells = target_atoms // 8
+    repeat = factorize_for_supercell(n_cells)
     
-    best_repeat = (1, 1, 1)
-    best_diff = float('inf')
-    
-    # 全探索
-    for nx in range(1, n_max + 1):
-        for ny in range(1, n_max + 1):
-            for nz in range(1, n_max + 1):
-                n_atoms = 8 * nx * ny * nz
-                diff = abs(n_atoms - target_atoms)
-                
-                # より近いものを見つけたら更新
-                if diff < best_diff:
-                    best_diff = diff
-                    best_repeat = (nx, ny, nz)
-                
-                # 完全一致なら終了
-                if diff == 0:
-                    supercell = si_unit.repeat(best_repeat)
-                    return supercell
-                
-                # これ以上nzを増やしても離れるだけなので打ち切り
-                if n_atoms > target_atoms:
-                    break
-    
-    supercell = si_unit.repeat(best_repeat)
+    supercell = si_unit.repeat(repeat)
     return supercell
 
 
@@ -95,7 +110,8 @@ def run_md_benchmark(atoms: Atoms, calculator, n_steps: int = 200,
 
 
 def main():
-    target_atom_counts = [100, 1000, 10000, 20000, 30000, 40000, 50000]
+    # 8の倍数を使用（100 → 96 に変更）
+    target_atom_counts = [96, 1000, 10000, 20000, 30000, 40000, 50000]
     n_steps = 200
     temperature = 300.0
     timestep = 1.0
@@ -123,26 +139,28 @@ def main():
     print(f"Timestep: {timestep} fs")
     print("=" * 70)
     
-    # 事前に原子数を確認表示
-    print("\nTarget vs Actual atom counts:")
+    # 事前に原子数とセル構造を確認表示
+    print("\nTarget atom counts and supercell structure:")
     for target_n in target_atom_counts:
-        atoms = create_si_supercell(target_n)
-        print(f"  Target: {target_n:>6} -> Actual: {len(atoms):>6}")
+        n_cells = target_n // 8 if target_n % 8 == 0 else round(target_n / 8)
+        repeat = factorize_for_supercell(n_cells)
+        actual = 8 * repeat[0] * repeat[1] * repeat[2]
+        print(f"  Target: {target_n:>6} -> Repeat: {repeat} -> Actual: {actual:>6}")
     print("=" * 70)
     
     results = []
     
     for target_n in target_atom_counts:
-        print(f"\nPreparing Si supercell with ~{target_n} atoms...")
+        print(f"\nPreparing Si supercell with {target_n} atoms...")
         atoms = create_si_supercell(target_n)
         actual_n = len(atoms)
-        print(f"Actual atom count: {actual_n}")
+        print(f"  Actual atom count: {actual_n}")
         
         # メモリクリア
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        print(f"Running MD benchmark ({n_steps} steps)...")
+        print(f"  Running MD benchmark ({n_steps} steps)...")
         try:
             result = run_md_benchmark(
                 atoms.copy(), 
