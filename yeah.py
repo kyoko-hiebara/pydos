@@ -111,7 +111,7 @@ def run_md_benchmark(atoms: Atoms, calculator, n_steps: int = 200,
 
 def main():
     # 8の倍数を使用（100 → 96 に変更）
-    target_atom_counts = [96, 1000, 10000, 20000, 30000, 40000, 50000]
+    target_atom_counts = [96, 1000, 5000, 10000, 15000, 20000, 30000]
     n_steps = 200
     temperature = 300.0
     timestep = 1.0
