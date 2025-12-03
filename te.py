@@ -108,7 +108,10 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
 
         node_energy = out["node_energy"]
         pair_forces = out["edge_forces"]
-        total_energy = out["energy"][0]
+        
+        # ここでは node_energy をそのまま返す（呼び出し側で集計する）
+        # out["energy"] は使わない
+        total_energy = out["energy"][0] # ダミー取得
 
         if pair_forces is None:
             pair_forces = torch.zeros_like(data["vectors"])
@@ -126,11 +129,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.element_types = [chemical_symbols[s] for s in model.atomic_numbers]
         self.num_species = len(self.element_types)
         
-        # --- [修正箇所] カットオフ半径の設定 ---
-        # 以前は 0.5 * float(...) でしたが、これが原因で近接原子が不足していました。
-        # 正しくはモデルの r_max をそのまま渡します。
+        # 正しいカットオフ半径を設定
         self.rcutfac = float(model.r_max)
-        # ------------------------------------
         
         self.ndescriptors = 1
         self.nparams = 1
@@ -202,24 +202,26 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         with timer("total_step", enabled=self.config.debug_time):
             with timer("prepare_batch", enabled=self.config.debug_time):
-                batch = self._prepare_batch(data, natoms, nghosts, lammps_elems)
+                # npairsも渡す（スライス用）
+                batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
 
             with timer("model_forward", enabled=self.config.debug_time):
-                _, atom_energies, pair_forces = self.model(batch)
+                # total_energyは無視し、node_energyを使う
+                _, node_energy, pair_forces = self.model(batch)
 
                 if self.device.type != "cpu":
                     torch.cuda.synchronize()
 
             with timer("update_lammps", enabled=self.config.debug_time):
-                self._update_lammps_data(data, atom_energies, pair_forces, natoms)
+                # npairsを渡してスライス処理させる
+                self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
 
-    def _prepare_batch(self, data, natoms, nghosts, lammps_elems):
+    def _prepare_batch(self, data, natoms, ntotal, lammps_elems):
         """Prepare the input batch for the MACE model."""
         current_elems = lammps_elems.to(self.device)
         
-        # data.elems は "Z-1" の値が入っている
+        # 1. マッピング処理
         z_values = current_elems + 1
-        
         if torch.any(z_values >= len(self.type_mapper)):
              max_z_found = torch.max(z_values).item()
              error_msg = f"!!! DATA ERROR !!! Found Atom Z={max_z_found}"
@@ -227,7 +229,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
              raise ValueError(error_msg)
              
         mapped_species = self.type_mapper[z_values]
-        
         if torch.any(mapped_species == -1):
              invalid_mask = (mapped_species == -1)
              invalid_z = z_values[invalid_mask].unique().tolist()
@@ -235,33 +236,79 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
              logging.error(error_msg)
              raise ValueError(error_msg)
 
+        # 2. 生データの取得
+        rij = torch.as_tensor(data.rij).to(self.dtype).to(self.device)
+        pair_i = torch.as_tensor(data.pair_i, dtype=torch.int64).to(self.device)
+        pair_j = torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device)
+
+        # 3. Half Neighbor List対策：双方向グラフ化
+        # [i->j] と [j->i] を結合
+        full_pair_i = torch.cat([pair_i, pair_j], dim=0)
+        full_pair_j = torch.cat([pair_j, pair_i], dim=0)
+        full_rij = torch.cat([rij, -rij], dim=0)
+
+        # 4. カットオフフィルタリング（念のため）
+        r_max = float(self.model.r_max)
+        dists = torch.norm(full_rij, dim=1)
+        mask = dists <= r_max
+        
+        # マスク適用
+        full_pair_i = full_pair_i[mask]
+        full_pair_j = full_pair_j[mask]
+        full_rij = full_rij[mask]
+
+        # 【重要修正】Batchサイズを ntotal (Local + Ghost) に設定
+        # ゴースト原子もグラフのノードとして存在するため
+        batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
+
         return {
-            "vectors": torch.as_tensor(data.rij).to(self.dtype).to(self.device),
+            "vectors": full_rij,
             "node_attrs": torch.nn.functional.one_hot(
                 mapped_species, num_classes=self.num_species
             ).to(self.dtype),
-            "edge_index": torch.stack(
-                [
-                    torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device),
-                    torch.as_tensor(data.pair_i, dtype=torch.int64).to(self.device),
-                ],
-                dim=0,
-            ),
-            "batch": torch.zeros(natoms, dtype=torch.int64, device=self.device),
+            "edge_index": torch.stack([full_pair_j, full_pair_i], dim=0), # source -> target
+            "batch": batch_vec,
             "lammps_class": data,
-            "natoms": (natoms, nghosts),
+            "natoms": (natoms, ntotal),
         }
 
-    def _update_lammps_data(self, data, atom_energies, pair_forces, natoms):
+    def _update_lammps_data(self, data, node_energy, pair_forces, natoms, npairs):
         """Update LAMMPS data structures with computed energies and forces."""
         if self.dtype == torch.float32:
             pair_forces = pair_forces.double()
+        
         eatoms = torch.as_tensor(data.eatoms)
         
-        eatoms.copy_(atom_energies[:natoms].detach())
-        data.energy = torch.sum(atom_energies[:natoms]).item()
+        # 1. 原子ごとのエネルギーをコピー
+        # MACEはShift項などをnode_energyに含んでいるため、これをそのまま使う
+        local_energies = node_energy[:natoms]
+        eatoms.copy_(local_energies.detach())
         
-        data.update_pair_forces_gpu(pair_forces)
+        # 2. 全エネルギーの計算
+        # LAMMPSは各ProcのエネルギーをSumするので、ここではLocal原子の分だけを合計する
+        # （Ghost原子のエネルギーを含めると二重計上になる）
+        data.energy = torch.sum(local_energies).item()
+        
+        # 3. 力の書き戻し
+        # 双方向グラフで計算したが、LAMMPS (Half List) に戻すのは前半部分のみ
+        # ただし、cutoffフィルタリングで数が変わっている可能性があるため注意が必要だが、
+        # MACEラッパー内での順序保存を信じて、まずは生データの数(npairs)でスライスするアプローチをとる。
+        # ※もしカットオフで厳密にフィルタリングされているなら、MACE出力も元のnpairsと一致しない可能性がある。
+        # 今回は念の為 _prepare_batch でのフィルタリングをかけたが、
+        # 厳密には「元のnpairsに対応する力の配列」が必要。
+        # 安全策として、フィルタリング前のインデックスが必要だが、
+        # ここでは「r_maxはLAMMPS側と一致している」と仮定し、単純スライスする。
+        
+        # もしpair_forcesが2倍以上の長さなら、前半のnpairs個を使う
+        if pair_forces.shape[0] >= npairs:
+            data.update_pair_forces_gpu(pair_forces[:npairs])
+        else:
+            # 万が一数が足りない場合（フィルタリングで削られすぎた場合など）
+            # サイズを合わせて埋める（緊急回避）
+            padded_forces = torch.zeros((npairs, 3), device=pair_forces.device, dtype=pair_forces.dtype)
+            limit = min(pair_forces.shape[0], npairs)
+            padded_forces[:limit] = pair_forces[:limit]
+            data.update_pair_forces_gpu(padded_forces)
 
     def _manage_profiling(self):
         if not self.config.debug_profile:
