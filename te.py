@@ -26,7 +26,7 @@ class MACELammpsConfig:
         self.profile_end_step = int(os.environ.get("MACE_PROFILE_END", "10"))
         self.allow_cpu = self._get_env_bool("MACE_ALLOW_CPU", False)
         self.force_cpu = self._get_env_bool("MACE_FORCE_CPU", False)
-        # ここで確実に定義
+        # 安全策: 属性として確実に定義
         self.device_str = os.environ.get("MACE_DEVICE", "") 
 
     @staticmethod
@@ -82,7 +82,6 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
             compute_edge_forces=True,
             lammps_mliap=True,
         )
-        # out["energy"] は (batch_size,) なので [0] を返す
         return out["energy"][0], out["node_energy"], out["edge_forces"]
 
 class LAMMPS_MLIAP_MACE(MLIAPUnified):
@@ -103,6 +102,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.device = "cpu"
         self.initialized = False
         self.step = 0
+        
+        # 初期化（消えても良いように後でリカバリする）
         self.type_mapper = None
         self._setup_z_mapper(model)
 
@@ -117,9 +118,11 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.type_mapper = mapper
 
     def _initialize_device(self, data):
-        # 安全策: getattr で取得
+        # 安全策: Configの属性チェック
+        if not hasattr(self, 'config'):
+             self.config = MACELammpsConfig()
+
         device_str = getattr(self.config, "device_str", "")
-        
         if device_str:
             device = torch.device(device_str)
         else:
@@ -127,6 +130,12 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             
         self.device = device
         self.model = self.model.to(device)
+
+        # 【修正】type_mapper が消えている場合の自己修復ブロック
+        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
+            logging.info("Recovering type_mapper in _initialize_device...")
+            self._setup_z_mapper(self.model)
+
         self.type_mapper = self.type_mapper.to(device)
         
         logging.info(f"MACE model initialized on device: {device}")
@@ -137,18 +146,17 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         ntotal = data.ntotal
         npairs = data.npairs
 
+        # 初期化チェック & 実行
         if not self.initialized:
             self._initialize_device(data)
 
-        # 標準モード (非Kokkos) なら、ここでntotal分の原子種が正しく取れる
+        # CPUモードなら ntotal 分の原子種が取れる
         lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
 
-        # 念のためのチェック
         if lammps_elems.size(0) < ntotal:
-             # 万が一 Kokkos版などで実行されてサイズが足りない場合の警告
              raise ValueError(
                  f"Data Error: Received {lammps_elems.size(0)} atoms, but expected {ntotal} (Local+Ghost). "
-                 "Please run LAMMPS WITHOUT '-sf kk' / '-pk kokkos' arguments."
+                 "Ensure you are running WITHOUT '-sf kk' (Kokkos mode)."
              )
 
         self.step += 1
@@ -161,23 +169,25 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             # Batch準備
             batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
             
-            # MACE計算 (GPUがあればGPUで行われる)
+            # MACE計算
             _, node_energy, pair_forces = self.model(batch)
             
             if self.device.type != "cpu":
                 torch.cuda.synchronize()
 
-            # LAMMPSへ書き戻し
+            # 書き戻し
             self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
 
     def _prepare_batch(self, data, natoms, ntotal, lammps_elems):
         """Prepare the input batch for the MACE model."""
         current_elems = lammps_elems.to(self.device)
         
-        # マッピング (Z-1 -> Index)
+        # 自己修復チェック（念の為）
+        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
+             self._initialize_device(data)
+
+        # マッピング
         z_values = current_elems + 1
-        
-        # エラーチェック
         if torch.any(z_values >= len(self.type_mapper)):
              max_z = torch.max(z_values).item()
              raise ValueError(f"Found undefined atom Z={max_z}")
@@ -186,13 +196,11 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         if torch.any(mapped_species == -1):
              raise ValueError("Found atom Z not in model support list.")
 
-        # 座標とペアリストの取得
         rij = torch.as_tensor(data.rij).to(self.dtype).to(self.device)
         pair_i = torch.as_tensor(data.pair_i, dtype=torch.int64).to(self.device)
         pair_j = torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device)
 
-        # 双方向グラフ化 (Neigh Half -> Full)
-        # LAMMPSの標準neighbor list (half) を双方向に展開
+        # 双方向グラフ化
         full_pair_i = torch.cat([pair_i, pair_j], dim=0)
         full_pair_j = torch.cat([pair_j, pair_i], dim=0)
         full_rij = torch.cat([rij, -rij], dim=0)
@@ -206,7 +214,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         full_pair_j = full_pair_j[mask]
         full_rij = full_rij[mask]
 
-        # Batchサイズを ntotal (Local+Ghost) に設定
+        # Batchサイズ設定
         batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
 
         return {
@@ -219,23 +227,19 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         }
 
     def _update_lammps_data(self, data, node_energy, pair_forces, natoms, npairs):
-        """Update LAMMPS data structures."""
         if self.dtype == torch.float32:
             pair_forces = pair_forces.double()
             
         eatoms = torch.as_tensor(data.eatoms)
         
-        # エネルギー書き戻し (Local原子のみ)
+        # エネルギー書き戻し
         eatoms.copy_(node_energy[:natoms].detach())
         data.energy = torch.sum(node_energy[:natoms]).item()
         
-        # 力書き戻し
-        # 双方向化したpair_forcesから、元のペアリストに対応する前半部分を書き戻す
-        # フィルタリングの影響で数が減っている場合はパディングする
+        # 力書き戻し (前半部分のみ)
         if pair_forces.shape[0] >= npairs:
-            data.update_pair_forces(pair_forces[:npairs].cpu().numpy()) # 標準モードなのでCPU numpy経由が安全
+            data.update_pair_forces(pair_forces[:npairs].cpu().numpy())
         else:
-            # 万が一数が足りない場合
             padded = torch.zeros((npairs, 3), device=pair_forces.device, dtype=pair_forces.dtype)
             limit = pair_forces.shape[0]
             padded[:limit] = pair_forces
