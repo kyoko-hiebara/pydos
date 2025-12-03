@@ -17,8 +17,10 @@ except ImportError:
         def __init__(self):
             pass
 
+
 class MACELammpsConfig:
     """Configuration settings for MACE-LAMMPS integration."""
+
     def __init__(self):
         self.debug_time = self._get_env_bool("MACE_TIME", False)
         self.debug_profile = self._get_env_bool("MACE_PROFILE", False)
@@ -29,13 +31,21 @@ class MACELammpsConfig:
 
     @staticmethod
     def _get_env_bool(var_name: str, default: bool) -> bool:
-        return os.environ.get(var_name, str(default)).lower() in ("true", "1", "t", "yes")
+        return os.environ.get(var_name, str(default)).lower() in (
+            "true",
+            "1",
+            "t",
+            "yes",
+        )
+
 
 @contextmanager
 def timer(name: str, enabled: bool = True):
+    """Context manager for timing code blocks."""
     if not enabled:
         yield
         return
+
     start = time.perf_counter()
     try:
         yield
@@ -43,8 +53,11 @@ def timer(name: str, enabled: bool = True):
         elapsed = time.perf_counter() - start
         logging.info(f"Timer - {name}: {elapsed*1000:.3f} ms")
 
+
 @compile_mode("script")
 class MACEEdgeForcesWrapper(torch.nn.Module):
+    """Wrapper that adds per-pair force computation to a MACE model."""
+
     def __init__(self, model: torch.nn.Module, **kwargs):
         super().__init__()
         self.model = model
@@ -53,11 +66,15 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
         self.register_buffer("num_interactions", model.num_interactions)
         self.register_buffer(
             "total_charge",
-            kwargs.get("total_charge", torch.tensor([0.0], dtype=torch.get_default_dtype())),
+            kwargs.get(
+                "total_charge", torch.tensor([0.0], dtype=torch.get_default_dtype())
+            ),
         )
         self.register_buffer(
             "total_spin",
-            kwargs.get("total_spin", torch.tensor([1.0], dtype=torch.get_default_dtype())),
+            kwargs.get(
+                "total_spin", torch.tensor([1.0], dtype=torch.get_default_dtype())
+            ),
         )
 
         if not hasattr(model, "heads"):
@@ -70,7 +87,10 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
-    def forward(self, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, data: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute energies and per-pair forces."""
         data["head"] = self.head
         data["total_charge"] = self.total_charge
         data["total_spin"] = self.total_spin
@@ -112,28 +132,28 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.device = "cpu"
         self.initialized = False
         self.step = 0
-        
-        # --- [修正箇所1] マッピングテーブルの作成 ---
+
+        # --- [修正箇所] マッピング設定 ---
         # lmp.in の `pair_coeff * * Si O H` に対応する原子番号 (Z)
         # Type 1 = Si(14), Type 2 = O(8), Type 3 = H(1)
-        self.lammps_species_z = [14, 8, 1] 
+        self.lammps_species_z = [14, 8, 1]
         
+        # マッパー変数を初期化
         self.type_mapper = None
+        # マッパーを作成
         self._setup_type_mapper(model)
-        # ----------------------------------------
 
     def _setup_type_mapper(self, model):
         """LAMMPS Type ID -> MACE Model Index のマッピングを作成"""
-        # モデルが期待する原子番号リスト (例: [1, 8, 14])
+        # モデルが期待する原子番号リスト
         model_z_list = model.atomic_numbers.cpu().numpy().tolist()
         
         # マッピング用配列 (LAMMPS Type ID は 1-based なので +1 のサイズ確保)
-        # 初期値 -1 で埋めておく（エラー検出用）
         mapper = torch.full((len(self.lammps_species_z) + 1,), -1, dtype=torch.int64)
         
         logging.info("--- MACE-LAMMPS Type Mapping ---")
         logging.info(f"Model expects indices for Z: {model_z_list}")
-        logging.info(f"LAMMPS defined Z (from python script): {self.lammps_species_z}")
+        logging.info(f"LAMMPS defined Z: {self.lammps_species_z}")
         
         for i, z in enumerate(self.lammps_species_z):
             lammps_type = i + 1  # LAMMPS type is 1-based
@@ -160,10 +180,11 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         self.device = device
         self.model = self.model.to(device)
-        # Mapperもデバイスへ転送
+
+        # マッパーもデバイスへ転送
         if self.type_mapper is not None:
             self.type_mapper = self.type_mapper.to(device)
-            
+
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
 
@@ -172,6 +193,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         ntotal = data.ntotal
         nghosts = ntotal - natoms
         npairs = data.npairs
+        
         # LAMMPSから来る生データ (Type ID: 1, 2, 3...)
         lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
 
@@ -186,7 +208,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         with timer("total_step", enabled=self.config.debug_time):
             with timer("prepare_batch", enabled=self.config.debug_time):
-                # lammps_elems を渡して内部で変換する
+                # 修正: lammps_elemsを渡す
                 batch = self._prepare_batch(data, natoms, nghosts, lammps_elems)
 
             with timer("model_forward", enabled=self.config.debug_time):
@@ -201,18 +223,16 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
     def _prepare_batch(self, data, natoms, nghosts, lammps_elems):
         """Prepare the input batch for the MACE model."""
         
-        # --- [修正箇所2] マッピングの適用 ---
-        # LAMMPS Type ID を MACE Index に変換
-        # data.elems がデバイスにあるか確認して map
+        # --- [修正箇所] マッピングの適用 ---
         current_elems = lammps_elems.to(self.device)
         
-        # 範囲外アクセスを防ぐチェック（必要なら）
+        # 範囲外アクセスを防ぐ安全策
         if torch.any(current_elems >= len(self.type_mapper)):
              raise ValueError("LAMMPS atom type exceeds defined species list size.")
              
         mapped_species = self.type_mapper[current_elems]
         # --------------------------------
-        
+
         return {
             "vectors": torch.as_tensor(data.rij).to(self.dtype).to(self.device),
             "node_attrs": torch.nn.functional.one_hot(
@@ -236,10 +256,10 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             pair_forces = pair_forces.double()
         eatoms = torch.as_tensor(data.eatoms)
         
-        # [修正箇所3] detach()を使用
+        # [修正箇所] detach()で勾配切り離し
         eatoms.copy_(atom_energies[:natoms].detach())
         
-        # [修正箇所4] .item() でスカラー化して警告回避
+        # [修正箇所] .item() でスカラー化して警告回避
         data.energy = torch.sum(atom_energies[:natoms]).item()
         
         data.update_pair_forces_gpu(pair_forces)
