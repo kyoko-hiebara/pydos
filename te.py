@@ -109,8 +109,6 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
 
         node_energy = out["node_energy"]
         pair_forces = out["edge_forces"]
-        
-        # total_energyは使わないが型合わせのために取得
         total_energy = out["energy"][0]
 
         if pair_forces is None:
@@ -129,9 +127,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.element_types = [chemical_symbols[s] for s in model.atomic_numbers]
         self.num_species = len(self.element_types)
         
-        # 正しいカットオフ半径を設定
         self.rcutfac = float(model.r_max)
-        
         self.ndescriptors = 1
         self.nparams = 1
         self.dtype = model.r_max.dtype
@@ -139,7 +135,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.initialized = False
         self.step = 0
 
-        # マッパー変数を初期化
         self.type_mapper = None
         self._setup_z_mapper(model)
 
@@ -161,11 +156,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         using_kokkos = "kokkos" in data.__class__.__module__.lower()
 
         if using_kokkos and not self.config.force_cpu:
-            # ここではまだ torch.tensor化しない (data.elemsが不完全な可能性があるため)
-            # 便宜上CPUにしておく、実際の転送は後で行う
+            # 初期化チェック時はまだGPUかどうか不明確な場合があるため柔軟に
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if device.type == "cpu" and not self.config.allow_cpu:
-                 logging.warning("CUDA requested but might fallback to CPU during init check.")
         else:
             device = torch.device("cpu")
 
@@ -184,55 +176,68 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         
     def _extended_elems_read(self, data_elems, nlocal, ntotal):
         """
-        data.elems が nlocal 分しか返さない場合に、
-        メモリの連続性を利用して ntotal 分を強制的に読み出すハック関数。
+        Ghost原子を含む全原子(ntotal)のタイプを取得するためのメモリ拡張読み出し。
+        NumPyを経由せず、memoryviewとctypesを使用して強制的にアドレスから読み出す。
         """
-        # まずNumPy配列としてアクセス (コピーしない)
+        # data_elemsが既に十分なサイズを持っているならそのままTensor化
+        # Pythonのlen()はnlocalを返すようにラップされていることが多いので、
+        # まずは単純に変換してサイズチェック
         try:
-            tmp_np = np.array(data_elems, copy=False)
-        except Exception as e:
-            # Numpy変換すらできない場合は諦めてそのまま返す（エラーになるだろうが）
-            logging.error(f"Failed to convert data.elems to numpy: {e}")
-            return torch.as_tensor(data_elems, dtype=torch.int64)
+            # コピーが発生しても良いのでまずはTensorにしてみる
+            simple_tensor = torch.as_tensor(data_elems, dtype=torch.int64, device='cpu')
+            if simple_tensor.numel() >= ntotal:
+                return simple_tensor[:ntotal]
+        except Exception:
+            pass # 失敗したら下のハックへ
 
-        current_size = tmp_np.size
-        
-        # サイズが足りていればそのままTensor化
-        if current_size >= ntotal:
-            return torch.as_tensor(tmp_np[:ntotal], dtype=torch.int64)
-        
-        # サイズ不足の場合 (nlocal == current_size < ntotal)
-        # メモリアドレスを取得して拡張読み出しを行う
-        if current_size == nlocal:
-            logging.info(f"Extending atoms array from {nlocal} to {ntotal} using memory hack.")
+        # --- 強制メモリ拡張ハック (Buffer Interface + Ctypes) ---
+        try:
+            # 1. memoryviewを作成 (これはコピーなしでメモリを参照する)
+            mv = memoryview(data_elems)
             
-            # アドレス取得
-            if hasattr(tmp_np, '__array_interface__'):
-                addr = tmp_np.__array_interface__['data'][0]
-            else:
-                logging.error("data.elems does not support __array_interface__. Cannot extend memory.")
-                return torch.as_tensor(tmp_np, dtype=torch.int64)
-
-            # 型に応じたctypes配列を作成
-            if tmp_np.dtype == np.int32:
+            # 2. アイテムサイズと形式の判定
+            itemsize = mv.itemsize
+            if itemsize == 4:
                 c_type = ctypes.c_int32
-            elif tmp_np.dtype == np.int64:
+                np_dtype = np.int32
+            elif itemsize == 8:
                 c_type = ctypes.c_int64
+                np_dtype = np.int64
             else:
-                # デフォルトでint32を試す
-                logging.warning(f"Unknown dtype {tmp_np.dtype}, assuming int32.")
+                # 不明な場合はint32と仮定して進む（危険だが止まるよりマシ）
                 c_type = ctypes.c_int32
+                np_dtype = np.int32
 
-            # メモリから再構築
-            try:
-                extended_buffer = (c_type * ntotal).from_address(addr)
-                extended_np = np.ctypeslib.as_array(extended_buffer)
-                return torch.as_tensor(extended_np.copy(), dtype=torch.int64) # 安全のためコピー
-            except Exception as e:
-                logging.error(f"Memory extension hack failed: {e}")
-                return torch.as_tensor(tmp_np, dtype=torch.int64)
-        
-        return torch.as_tensor(tmp_np, dtype=torch.int64)
+            # 3. バッファのアドレスを取得
+            # CPythonのPyBuffer_Info的な情報からアドレスを吸い出す
+            # mv_obj -> c_void_p 変換で先頭アドレスを取得
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
+            
+            # 4. アドレスから ntotal 分の配列として再定義
+            extended_buffer = (c_type * ntotal).from_address(addr)
+            
+            # 5. 安全な領域（NumPy/Torch）へコピー
+            # ここで from_buffer を使うと安全にコピーできる
+            np_array = np.ctypeslib.as_array(extended_buffer).astype(np.int64)
+            
+            return torch.as_tensor(np_array)
+
+        except Exception as e:
+            logging.error(f"Memory extension hack failed: {e}")
+            
+            # --- 最終手段: 失敗したらエラーにする ---
+            # ここで中途半端なサイズ(33)を返すと shape mismatch で落ちるため、
+            # 明確にエラーを吐いて止めるべきだが、どうしても動かしたい場合は
+            # 「Local原子の情報を繰り返して埋める」などの荒業がある。
+            # しかし物理的に間違った結果になるため、ここではエラーログを出して
+            # nlocal分だけ返す（結果的に shape mismatch になるが原因はログに残る）
+            
+            # もし simple_tensor が作れていればそれを返す
+            if 'simple_tensor' in locals():
+                 logging.error(f"Returning truncated atoms ({simple_tensor.numel()}) vs requested ({ntotal}). MACE will crash.")
+                 return simple_tensor
+            
+            raise ValueError("Could not retrieve ghost atom types from LAMMPS data.")
 
     def compute_forces(self, data):
         natoms = data.nlocal
@@ -243,7 +248,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         if not self.initialized:
             self._initialize_device(data)
 
-        # 【修正】Ghost原子の情報を取得するための拡張読み出し
+        # 拡張読み出しを実行 (ntotal分取得)
         lammps_elems = self._extended_elems_read(data.elems, natoms, ntotal)
 
         self.step += 1
@@ -254,7 +259,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         with timer("total_step", enabled=self.config.debug_time):
             with timer("prepare_batch", enabled=self.config.debug_time):
-                # ntotal (Total原子数) を渡す
+                # ntotal を渡す
                 batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
 
             with timer("model_forward", enabled=self.config.debug_time):
@@ -270,14 +275,17 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         """Prepare the input batch for the MACE model."""
         current_elems = lammps_elems.to(self.device)
         
-        # 1. マッピング処理
-        # 要素数が ntotal (788) であることを確認
+        # サイズチェック: 取得した原子数が ntotal より少なければエラー
         if current_elems.size(0) < ntotal:
-             # ハック失敗時などの安全策: 足りない分を0(最初の原子)などで埋めるか、エラーにする
-             # ここではエラーにして原因を通知
-             raise ValueError(f"Atom list size ({current_elems.size(0)}) < ntotal ({ntotal}). Ghost atoms missing.")
+             msg = f"Atom list size ({current_elems.size(0)}) < ntotal ({ntotal}). Ghost atoms missing. Memory hack failed."
+             logging.error(msg)
+             # ここで強制終了しないと、後で shape mismatch になる
+             raise ValueError(msg)
 
+        # 1. マッピング処理
         z_values = current_elems + 1
+        
+        # 範囲外チェック
         if torch.any(z_values >= len(self.type_mapper)):
              max_z_found = torch.max(z_values).item()
              error_msg = f"!!! DATA ERROR !!! Found Atom Z={max_z_found}"
@@ -285,6 +293,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
              raise ValueError(error_msg)
              
         mapped_species = self.type_mapper[z_values]
+        
+        # モデル未定義原子チェック
         if torch.any(mapped_species == -1):
              invalid_mask = (mapped_species == -1)
              invalid_z = z_values[invalid_mask].unique().tolist()
@@ -312,7 +322,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         full_rij = full_rij[mask]
 
         # Batchサイズを ntotal (Local + Ghost) に設定
-        # これで node_attrs (ntotal) とサイズが一致する
         batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
 
         return {
