@@ -133,47 +133,45 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.initialized = False
         self.step = 0
 
-        # --- [修正箇所] マッピング設定 ---
-        # lmp.in の `pair_coeff * * Si O H` に対応する原子番号 (Z)
-        # Type 1 = Si(14), Type 2 = O(8), Type 3 = H(1)
-        self.lammps_species_z = [14, 8, 1]
-        
-        # マッパー変数を初期化
+        # 初期化時に変数をセットするが、失敗しても後のメソッドでリカバリする設計にする
+        self.lammps_species_z = [14, 8, 1]  # Si, O, H
         self.type_mapper = None
-        # マッパーを作成
-        self._setup_type_mapper(model)
 
     def _setup_type_mapper(self, model):
         """LAMMPS Type ID -> MACE Model Index のマッピングを作成"""
-        # モデルが期待する原子番号リスト
+        # まだ変数がなければここで定義（安全策）
+        if not hasattr(self, 'lammps_species_z'):
+            self.lammps_species_z = [14, 8, 1]
+
         model_z_list = model.atomic_numbers.cpu().numpy().tolist()
         
-        # マッピング用配列 (LAMMPS Type ID は 1-based なので +1 のサイズ確保)
+        # LAMMPS Type ID は 1-based
         mapper = torch.full((len(self.lammps_species_z) + 1,), -1, dtype=torch.int64)
         
         logging.info("--- MACE-LAMMPS Type Mapping ---")
-        logging.info(f"Model expects indices for Z: {model_z_list}")
-        logging.info(f"LAMMPS defined Z: {self.lammps_species_z}")
+        logging.info(f"Model Z List: {model_z_list}")
+        logging.info(f"LAMMPS Z List: {self.lammps_species_z}")
         
         for i, z in enumerate(self.lammps_species_z):
-            lammps_type = i + 1  # LAMMPS type is 1-based
+            lammps_type = i + 1
             if z in model_z_list:
                 model_idx = model_z_list.index(z)
                 mapper[lammps_type] = model_idx
-                logging.info(f"  LAMMPS Type {lammps_type} (Z={z}) -> MACE Index {model_idx}")
+                logging.info(f"  Type {lammps_type} (Z={z}) -> Index {model_idx}")
             else:
-                logging.warning(f"  Warning: LAMMPS element Z={z} not found in model!")
+                logging.warning(f"  Warning: Z={z} not in model!")
         
         self.type_mapper = mapper
 
     def _initialize_device(self, data):
+        """デバイス初期化とマッピングの強制セットアップ"""
         using_kokkos = "kokkos" in data.__class__.__module__.lower()
 
         if using_kokkos and not self.config.force_cpu:
             device = torch.as_tensor(data.elems).device
             if device.type == "cpu" and not self.config.allow_cpu:
                 raise ValueError(
-                    "GPU requested but tensor is on CPU. Set MACE_ALLOW_CPU=true to allow CPU computation."
+                    "GPU requested but tensor is on CPU. Set MACE_ALLOW_CPU=true."
                 )
         else:
             device = torch.device("cpu")
@@ -181,9 +179,16 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.device = device
         self.model = self.model.to(device)
 
-        # マッパーもデバイスへ転送
+        # --- [修正] 強制初期化ブロック ---
+        # __init__ が古いまま実行されていても、ここで必ず type_mapper を作る
+        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
+            logging.info("Initializing type_mapper inside _initialize_device (Lazy Load)")
+            self._setup_type_mapper(self.model)
+        
+        # デバイス転送
         if self.type_mapper is not None:
             self.type_mapper = self.type_mapper.to(device)
+        # -----------------------------
 
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
@@ -194,7 +199,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         nghosts = ntotal - natoms
         npairs = data.npairs
         
-        # LAMMPSから来る生データ (Type ID: 1, 2, 3...)
         lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
 
         if not self.initialized:
@@ -223,15 +227,18 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
     def _prepare_batch(self, data, natoms, nghosts, lammps_elems):
         """Prepare the input batch for the MACE model."""
         
-        # --- [修正箇所] マッピングの適用 ---
+        # --- マッピング適用 ---
+        # _initialize_device で必ず作られているはずだが、念のため hasattr チェック
+        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
+             self._initialize_device(data)
+
         current_elems = lammps_elems.to(self.device)
         
-        # 範囲外アクセスを防ぐ安全策
         if torch.any(current_elems >= len(self.type_mapper)):
              raise ValueError("LAMMPS atom type exceeds defined species list size.")
              
         mapped_species = self.type_mapper[current_elems]
-        # --------------------------------
+        # --------------------
 
         return {
             "vectors": torch.as_tensor(data.rij).to(self.dtype).to(self.device),
@@ -256,10 +263,9 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             pair_forces = pair_forces.double()
         eatoms = torch.as_tensor(data.eatoms)
         
-        # [修正箇所] detach()で勾配切り離し
         eatoms.copy_(atom_energies[:natoms].detach())
         
-        # [修正箇所] .item() でスカラー化して警告回避
+        # 警告対策: .item()
         data.energy = torch.sum(atom_energies[:natoms]).item()
         
         data.update_pair_forces_gpu(pair_forces)
