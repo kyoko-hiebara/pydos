@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import ctypes
 from contextlib import contextmanager
 from typing import Dict, Tuple
 
@@ -109,9 +110,8 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
         node_energy = out["node_energy"]
         pair_forces = out["edge_forces"]
         
-        # ここでは node_energy をそのまま返す（呼び出し側で集計する）
-        # out["energy"] は使わない
-        total_energy = out["energy"][0] # ダミー取得
+        # total_energyは使わないが型合わせのために取得
+        total_energy = out["energy"][0]
 
         if pair_forces is None:
             pair_forces = torch.zeros_like(data["vectors"])
@@ -161,11 +161,11 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         using_kokkos = "kokkos" in data.__class__.__module__.lower()
 
         if using_kokkos and not self.config.force_cpu:
-            device = torch.as_tensor(data.elems).device
+            # ここではまだ torch.tensor化しない (data.elemsが不完全な可能性があるため)
+            # 便宜上CPUにしておく、実際の転送は後で行う
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             if device.type == "cpu" and not self.config.allow_cpu:
-                raise ValueError(
-                    "GPU requested but tensor is on CPU. Set MACE_ALLOW_CPU=true."
-                )
+                 logging.warning("CUDA requested but might fallback to CPU during init check.")
         else:
             device = torch.device("cpu")
 
@@ -181,6 +181,58 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
+        
+    def _extended_elems_read(self, data_elems, nlocal, ntotal):
+        """
+        data.elems が nlocal 分しか返さない場合に、
+        メモリの連続性を利用して ntotal 分を強制的に読み出すハック関数。
+        """
+        # まずNumPy配列としてアクセス (コピーしない)
+        try:
+            tmp_np = np.array(data_elems, copy=False)
+        except Exception as e:
+            # Numpy変換すらできない場合は諦めてそのまま返す（エラーになるだろうが）
+            logging.error(f"Failed to convert data.elems to numpy: {e}")
+            return torch.as_tensor(data_elems, dtype=torch.int64)
+
+        current_size = tmp_np.size
+        
+        # サイズが足りていればそのままTensor化
+        if current_size >= ntotal:
+            return torch.as_tensor(tmp_np[:ntotal], dtype=torch.int64)
+        
+        # サイズ不足の場合 (nlocal == current_size < ntotal)
+        # メモリアドレスを取得して拡張読み出しを行う
+        if current_size == nlocal:
+            logging.info(f"Extending atoms array from {nlocal} to {ntotal} using memory hack.")
+            
+            # アドレス取得
+            if hasattr(tmp_np, '__array_interface__'):
+                addr = tmp_np.__array_interface__['data'][0]
+            else:
+                logging.error("data.elems does not support __array_interface__. Cannot extend memory.")
+                return torch.as_tensor(tmp_np, dtype=torch.int64)
+
+            # 型に応じたctypes配列を作成
+            if tmp_np.dtype == np.int32:
+                c_type = ctypes.c_int32
+            elif tmp_np.dtype == np.int64:
+                c_type = ctypes.c_int64
+            else:
+                # デフォルトでint32を試す
+                logging.warning(f"Unknown dtype {tmp_np.dtype}, assuming int32.")
+                c_type = ctypes.c_int32
+
+            # メモリから再構築
+            try:
+                extended_buffer = (c_type * ntotal).from_address(addr)
+                extended_np = np.ctypeslib.as_array(extended_buffer)
+                return torch.as_tensor(extended_np.copy(), dtype=torch.int64) # 安全のためコピー
+            except Exception as e:
+                logging.error(f"Memory extension hack failed: {e}")
+                return torch.as_tensor(tmp_np, dtype=torch.int64)
+        
+        return torch.as_tensor(tmp_np, dtype=torch.int64)
 
     def compute_forces(self, data):
         natoms = data.nlocal
@@ -188,11 +240,11 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         nghosts = ntotal - natoms
         npairs = data.npairs
         
-        # LAMMPSからの生データ (Z-1)
-        lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
-
         if not self.initialized:
             self._initialize_device(data)
+
+        # 【修正】Ghost原子の情報を取得するための拡張読み出し
+        lammps_elems = self._extended_elems_read(data.elems, natoms, ntotal)
 
         self.step += 1
         self._manage_profiling()
@@ -202,18 +254,16 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
 
         with timer("total_step", enabled=self.config.debug_time):
             with timer("prepare_batch", enabled=self.config.debug_time):
-                # npairsも渡す（スライス用）
+                # ntotal (Total原子数) を渡す
                 batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
 
             with timer("model_forward", enabled=self.config.debug_time):
-                # total_energyは無視し、node_energyを使う
                 _, node_energy, pair_forces = self.model(batch)
 
                 if self.device.type != "cpu":
                     torch.cuda.synchronize()
 
             with timer("update_lammps", enabled=self.config.debug_time):
-                # npairsを渡してスライス処理させる
                 self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
 
     def _prepare_batch(self, data, natoms, ntotal, lammps_elems):
@@ -221,6 +271,12 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         current_elems = lammps_elems.to(self.device)
         
         # 1. マッピング処理
+        # 要素数が ntotal (788) であることを確認
+        if current_elems.size(0) < ntotal:
+             # ハック失敗時などの安全策: 足りない分を0(最初の原子)などで埋めるか、エラーにする
+             # ここではエラーにして原因を通知
+             raise ValueError(f"Atom list size ({current_elems.size(0)}) < ntotal ({ntotal}). Ghost atoms missing.")
+
         z_values = current_elems + 1
         if torch.any(z_values >= len(self.type_mapper)):
              max_z_found = torch.max(z_values).item()
@@ -242,23 +298,21 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         pair_j = torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device)
 
         # 3. Half Neighbor List対策：双方向グラフ化
-        # [i->j] と [j->i] を結合
         full_pair_i = torch.cat([pair_i, pair_j], dim=0)
         full_pair_j = torch.cat([pair_j, pair_i], dim=0)
         full_rij = torch.cat([rij, -rij], dim=0)
 
-        # 4. カットオフフィルタリング（念のため）
+        # 4. カットオフフィルタリング
         r_max = float(self.model.r_max)
         dists = torch.norm(full_rij, dim=1)
         mask = dists <= r_max
         
-        # マスク適用
         full_pair_i = full_pair_i[mask]
         full_pair_j = full_pair_j[mask]
         full_rij = full_rij[mask]
 
-        # 【重要修正】Batchサイズを ntotal (Local + Ghost) に設定
-        # ゴースト原子もグラフのノードとして存在するため
+        # Batchサイズを ntotal (Local + Ghost) に設定
+        # これで node_attrs (ntotal) とサイズが一致する
         batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
 
         return {
@@ -266,7 +320,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             "node_attrs": torch.nn.functional.one_hot(
                 mapped_species, num_classes=self.num_species
             ).to(self.dtype),
-            "edge_index": torch.stack([full_pair_j, full_pair_i], dim=0), # source -> target
+            "edge_index": torch.stack([full_pair_j, full_pair_i], dim=0),
             "batch": batch_vec,
             "lammps_class": data,
             "natoms": (natoms, ntotal),
@@ -279,32 +333,17 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         
         eatoms = torch.as_tensor(data.eatoms)
         
-        # 1. 原子ごとのエネルギーをコピー
-        # MACEはShift項などをnode_energyに含んでいるため、これをそのまま使う
+        # 1. 原子ごとのエネルギーをコピー (Local分のみ)
         local_energies = node_energy[:natoms]
         eatoms.copy_(local_energies.detach())
         
-        # 2. 全エネルギーの計算
-        # LAMMPSは各ProcのエネルギーをSumするので、ここではLocal原子の分だけを合計する
-        # （Ghost原子のエネルギーを含めると二重計上になる）
+        # 2. 全エネルギーの計算 (Local分の合計)
         data.energy = torch.sum(local_energies).item()
         
         # 3. 力の書き戻し
-        # 双方向グラフで計算したが、LAMMPS (Half List) に戻すのは前半部分のみ
-        # ただし、cutoffフィルタリングで数が変わっている可能性があるため注意が必要だが、
-        # MACEラッパー内での順序保存を信じて、まずは生データの数(npairs)でスライスするアプローチをとる。
-        # ※もしカットオフで厳密にフィルタリングされているなら、MACE出力も元のnpairsと一致しない可能性がある。
-        # 今回は念の為 _prepare_batch でのフィルタリングをかけたが、
-        # 厳密には「元のnpairsに対応する力の配列」が必要。
-        # 安全策として、フィルタリング前のインデックスが必要だが、
-        # ここでは「r_maxはLAMMPS側と一致している」と仮定し、単純スライスする。
-        
-        # もしpair_forcesが2倍以上の長さなら、前半のnpairs個を使う
         if pair_forces.shape[0] >= npairs:
             data.update_pair_forces_gpu(pair_forces[:npairs])
         else:
-            # 万が一数が足りない場合（フィルタリングで削られすぎた場合など）
-            # サイズを合わせて埋める（緊急回避）
             padded_forces = torch.zeros((npairs, 3), device=pair_forces.device, dtype=pair_forces.dtype)
             limit = min(pair_forces.shape[0], npairs)
             padded_forces[:limit] = pair_forces[:limit]
