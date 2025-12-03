@@ -2,7 +2,6 @@ import logging
 import os
 import sys
 import time
-import ctypes
 from contextlib import contextmanager
 from typing import Dict, Tuple
 
@@ -18,35 +17,22 @@ except ImportError:
         def __init__(self):
             pass
 
-
 class MACELammpsConfig:
-    """Configuration settings for MACE-LAMMPS integration."""
-
     def __init__(self):
         self.debug_time = self._get_env_bool("MACE_TIME", False)
         self.debug_profile = self._get_env_bool("MACE_PROFILE", False)
-        self.profile_start_step = int(os.environ.get("MACE_PROFILE_START", "5"))
-        self.profile_end_step = int(os.environ.get("MACE_PROFILE_END", "10"))
-        self.allow_cpu = self._get_env_bool("MACE_ALLOW_CPU", False)
-        self.force_cpu = self._get_env_bool("MACE_FORCE_CPU", False)
+        # 0の場合は自動選択
+        self.device_str = os.environ.get("MACE_DEVICE", "") 
 
     @staticmethod
     def _get_env_bool(var_name: str, default: bool) -> bool:
-        return os.environ.get(var_name, str(default)).lower() in (
-            "true",
-            "1",
-            "t",
-            "yes",
-        )
-
+        return os.environ.get(var_name, str(default)).lower() in ("true", "1", "t", "yes")
 
 @contextmanager
 def timer(name: str, enabled: bool = True):
-    """Context manager for timing code blocks."""
     if not enabled:
         yield
         return
-
     start = time.perf_counter()
     try:
         yield
@@ -54,29 +40,16 @@ def timer(name: str, enabled: bool = True):
         elapsed = time.perf_counter() - start
         logging.info(f"Timer - {name}: {elapsed*1000:.3f} ms")
 
-
 @compile_mode("script")
 class MACEEdgeForcesWrapper(torch.nn.Module):
-    """Wrapper that adds per-pair force computation to a MACE model."""
-
     def __init__(self, model: torch.nn.Module, **kwargs):
         super().__init__()
         self.model = model
         self.register_buffer("atomic_numbers", model.atomic_numbers)
         self.register_buffer("r_max", model.r_max)
         self.register_buffer("num_interactions", model.num_interactions)
-        self.register_buffer(
-            "total_charge",
-            kwargs.get(
-                "total_charge", torch.tensor([0.0], dtype=torch.get_default_dtype())
-            ),
-        )
-        self.register_buffer(
-            "total_spin",
-            kwargs.get(
-                "total_spin", torch.tensor([1.0], dtype=torch.get_default_dtype())
-            ),
-        )
+        self.register_buffer("total_charge", kwargs.get("total_charge", torch.tensor([0.0])))
+        self.register_buffer("total_spin", kwargs.get("total_spin", torch.tensor([1.0])))
 
         if not hasattr(model, "heads"):
             model.heads = ["Default"]
@@ -88,10 +61,7 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
-    def forward(
-        self, data: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute energies and per-pair forces."""
+    def forward(self, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         data["head"] = self.head
         data["total_charge"] = self.total_charge
         data["total_spin"] = self.total_spin
@@ -106,20 +76,11 @@ class MACEEdgeForcesWrapper(torch.nn.Module):
             compute_edge_forces=True,
             lammps_mliap=True,
         )
-
-        node_energy = out["node_energy"]
-        pair_forces = out["edge_forces"]
-        total_energy = out["energy"][0]
-
-        if pair_forces is None:
-            pair_forces = torch.zeros_like(data["vectors"])
-
-        return total_energy, node_energy, pair_forces
-
+        # node_energy: (n_total,) -> 後でlocal分だけ取り出して使う
+        # pair_forces: (n_edges, 3)
+        return out["energy"][0], out["node_energy"], out["edge_forces"]
 
 class LAMMPS_MLIAP_MACE(MLIAPUnified):
-    """MACE integration for LAMMPS using the MLIAP interface."""
-
     def __init__(self, model, **kwargs):
         super().__init__()
         self.config = MACELammpsConfig()
@@ -127,208 +88,109 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.element_types = [chemical_symbols[s] for s in model.atomic_numbers]
         self.num_species = len(self.element_types)
         
+        # MACEのカットオフを正しく設定
         self.rcutfac = float(model.r_max)
+        
         self.ndescriptors = 1
         self.nparams = 1
         self.dtype = model.r_max.dtype
         self.device = "cpu"
         self.initialized = False
         self.step = 0
-
         self.type_mapper = None
         self._setup_z_mapper(model)
 
     def _setup_z_mapper(self, model):
-        """原子番号(Z) -> MACE Model Index のマッピングを作成"""
         model_z_list = model.atomic_numbers.cpu().numpy().tolist()
         max_z = 120
         mapper = torch.full((max_z,), -1, dtype=torch.int64)
-        
-        logging.info("--- MACE Atomic Number (Z) Mapping ---")
-        logging.info(f"Model expects indices for Z: {model_z_list}")
-        
         for idx, z in enumerate(model_z_list):
             if z < max_z:
                 mapper[z] = idx
         self.type_mapper = mapper
 
     def _initialize_device(self, data):
-        using_kokkos = "kokkos" in data.__class__.__module__.lower()
-
-        if using_kokkos and not self.config.force_cpu:
-            # 初期化チェック時はまだGPUかどうか不明確な場合があるため柔軟に
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ユーザー指定 または 自動検出でGPUを使う
+        if self.config.device_str:
+            device = torch.device(self.config.device_str)
         else:
-            device = torch.device("cpu")
-
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
         self.device = device
         self.model = self.model.to(device)
-
-        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
-            logging.info("Lazy initializing Z-mapper...")
-            self._setup_z_mapper(self.model)
-
-        if self.type_mapper is not None:
-            self.type_mapper = self.type_mapper.to(device)
-
+        self.type_mapper = self.type_mapper.to(device)
+        
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
-        
-    def _extended_elems_read(self, data_elems, nlocal, ntotal):
-        """
-        Ghost原子を含む全原子(ntotal)のタイプを取得するためのメモリ拡張読み出し。
-        NumPyを経由せず、memoryviewとctypesを使用して強制的にアドレスから読み出す。
-        """
-        # data_elemsが既に十分なサイズを持っているならそのままTensor化
-        # Pythonのlen()はnlocalを返すようにラップされていることが多いので、
-        # まずは単純に変換してサイズチェック
-        try:
-            # コピーが発生しても良いのでまずはTensorにしてみる
-            simple_tensor = torch.as_tensor(data_elems, dtype=torch.int64, device='cpu')
-            if simple_tensor.numel() >= ntotal:
-                return simple_tensor[:ntotal]
-        except Exception:
-            pass # 失敗したら下のハックへ
-
-        # --- 強制メモリ拡張ハック (Buffer Interface + Ctypes) ---
-        try:
-            # 1. memoryviewを作成 (これはコピーなしでメモリを参照する)
-            mv = memoryview(data_elems)
-            
-            # 2. アイテムサイズと形式の判定
-            itemsize = mv.itemsize
-            if itemsize == 4:
-                c_type = ctypes.c_int32
-                np_dtype = np.int32
-            elif itemsize == 8:
-                c_type = ctypes.c_int64
-                np_dtype = np.int64
-            else:
-                # 不明な場合はint32と仮定して進む（危険だが止まるよりマシ）
-                c_type = ctypes.c_int32
-                np_dtype = np.int32
-
-            # 3. バッファのアドレスを取得
-            # CPythonのPyBuffer_Info的な情報からアドレスを吸い出す
-            # mv_obj -> c_void_p 変換で先頭アドレスを取得
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
-            
-            # 4. アドレスから ntotal 分の配列として再定義
-            extended_buffer = (c_type * ntotal).from_address(addr)
-            
-            # 5. 安全な領域（NumPy/Torch）へコピー
-            # ここで from_buffer を使うと安全にコピーできる
-            np_array = np.ctypeslib.as_array(extended_buffer).astype(np.int64)
-            
-            return torch.as_tensor(np_array)
-
-        except Exception as e:
-            logging.error(f"Memory extension hack failed: {e}")
-            
-            # --- 最終手段: 失敗したらエラーにする ---
-            # ここで中途半端なサイズ(33)を返すと shape mismatch で落ちるため、
-            # 明確にエラーを吐いて止めるべきだが、どうしても動かしたい場合は
-            # 「Local原子の情報を繰り返して埋める」などの荒業がある。
-            # しかし物理的に間違った結果になるため、ここではエラーログを出して
-            # nlocal分だけ返す（結果的に shape mismatch になるが原因はログに残る）
-            
-            # もし simple_tensor が作れていればそれを返す
-            if 'simple_tensor' in locals():
-                 logging.error(f"Returning truncated atoms ({simple_tensor.numel()}) vs requested ({ntotal}). MACE will crash.")
-                 return simple_tensor
-            
-            raise ValueError("Could not retrieve ghost atom types from LAMMPS data.")
 
     def compute_forces(self, data):
         natoms = data.nlocal
         ntotal = data.ntotal
-        nghosts = ntotal - natoms
         npairs = data.npairs
-        
+
         if not self.initialized:
             self._initialize_device(data)
 
-        # 拡張読み出しを実行 (ntotal分取得)
-        lammps_elems = self._extended_elems_read(data.elems, natoms, ntotal)
+        # CPUモードなら、ここでntotal分の原子種が正しく取れるはず
+        lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
+
+        # 安全策: データの長さチェック
+        if lammps_elems.size(0) < ntotal:
+             # Kokkosモードで実行している場合の警告
+             raise ValueError(
+                 f"Data Error: Received {lammps_elems.size(0)} atoms, but expected {ntotal} (Local+Ghost). "
+                 "Please run LAMMPS without '-sf kk' or Kokkos package for mliap pair style."
+             )
 
         self.step += 1
-        self._manage_profiling()
-
+        
         if natoms == 0 or npairs <= 1:
             return
 
-        with timer("total_step", enabled=self.config.debug_time):
-            with timer("prepare_batch", enabled=self.config.debug_time):
-                # ntotal を渡す
-                batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
+        with timer("MACE_Step", enabled=self.config.debug_time):
+            # Batch準備
+            batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
+            
+            # MACE計算 (GPUで行われる)
+            _, node_energy, pair_forces = self.model(batch)
+            
+            if self.device.type != "cpu":
+                torch.cuda.synchronize()
 
-            with timer("model_forward", enabled=self.config.debug_time):
-                _, node_energy, pair_forces = self.model(batch)
-
-                if self.device.type != "cpu":
-                    torch.cuda.synchronize()
-
-            with timer("update_lammps", enabled=self.config.debug_time):
-                self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
+            # 結果書き戻し
+            self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
 
     def _prepare_batch(self, data, natoms, ntotal, lammps_elems):
-        """Prepare the input batch for the MACE model."""
         current_elems = lammps_elems.to(self.device)
         
-        # サイズチェック: 取得した原子数が ntotal より少なければエラー
-        if current_elems.size(0) < ntotal:
-             msg = f"Atom list size ({current_elems.size(0)}) < ntotal ({ntotal}). Ghost atoms missing. Memory hack failed."
-             logging.error(msg)
-             # ここで強制終了しないと、後で shape mismatch になる
-             raise ValueError(msg)
-
-        # 1. マッピング処理
+        # マッピング (Z-1 -> Index)
         z_values = current_elems + 1
-        
-        # 範囲外チェック
-        if torch.any(z_values >= len(self.type_mapper)):
-             max_z_found = torch.max(z_values).item()
-             error_msg = f"!!! DATA ERROR !!! Found Atom Z={max_z_found}"
-             logging.error(error_msg)
-             raise ValueError(error_msg)
-             
         mapped_species = self.type_mapper[z_values]
         
-        # モデル未定義原子チェック
-        if torch.any(mapped_species == -1):
-             invalid_mask = (mapped_species == -1)
-             invalid_z = z_values[invalid_mask].unique().tolist()
-             error_msg = f"!!! MODEL MISMATCH !!! Z={invalid_z} not in model."
-             logging.error(error_msg)
-             raise ValueError(error_msg)
-
-        # 2. 生データの取得
+        # 座標とペアリスト
         rij = torch.as_tensor(data.rij).to(self.dtype).to(self.device)
         pair_i = torch.as_tensor(data.pair_i, dtype=torch.int64).to(self.device)
         pair_j = torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device)
 
-        # 3. Half Neighbor List対策：双方向グラフ化
+        # 双方向グラフ化 (Neigh Half -> Full)
         full_pair_i = torch.cat([pair_i, pair_j], dim=0)
         full_pair_j = torch.cat([pair_j, pair_i], dim=0)
         full_rij = torch.cat([rij, -rij], dim=0)
-
-        # 4. カットオフフィルタリング
-        r_max = float(self.model.r_max)
+        
+        # カットオフフィルタ
         dists = torch.norm(full_rij, dim=1)
-        mask = dists <= r_max
+        mask = dists <= float(self.model.r_max)
         
         full_pair_i = full_pair_i[mask]
         full_pair_j = full_pair_j[mask]
         full_rij = full_rij[mask]
 
-        # Batchサイズを ntotal (Local + Ghost) に設定
+        # Batchサイズを ntotal に設定 (これで shape mismatch は起きない)
         batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
 
         return {
             "vectors": full_rij,
-            "node_attrs": torch.nn.functional.one_hot(
-                mapped_species, num_classes=self.num_species
-            ).to(self.dtype),
+            "node_attrs": torch.nn.functional.one_hot(mapped_species, num_classes=self.num_species).to(self.dtype),
             "edge_index": torch.stack([full_pair_j, full_pair_i], dim=0),
             "batch": batch_vec,
             "lammps_class": data,
@@ -336,44 +198,24 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         }
 
     def _update_lammps_data(self, data, node_energy, pair_forces, natoms, npairs):
-        """Update LAMMPS data structures with computed energies and forces."""
         if self.dtype == torch.float32:
             pair_forces = pair_forces.double()
-        
+            
         eatoms = torch.as_tensor(data.eatoms)
         
-        # 1. 原子ごとのエネルギーをコピー (Local分のみ)
-        local_energies = node_energy[:natoms]
-        eatoms.copy_(local_energies.detach())
+        # エネルギー書き戻し (Local原子のみ)
+        eatoms.copy_(node_energy[:natoms].detach())
+        data.energy = torch.sum(node_energy[:natoms]).item()
         
-        # 2. 全エネルギーの計算 (Local分の合計)
-        data.energy = torch.sum(local_energies).item()
-        
-        # 3. 力の書き戻し
+        # 力書き戻し (前半のペア数分だけ)
         if pair_forces.shape[0] >= npairs:
             data.update_pair_forces_gpu(pair_forces[:npairs])
         else:
-            padded_forces = torch.zeros((npairs, 3), device=pair_forces.device, dtype=pair_forces.dtype)
-            limit = min(pair_forces.shape[0], npairs)
-            padded_forces[:limit] = pair_forces[:limit]
-            data.update_pair_forces_gpu(padded_forces)
+            # フィルタリングで減った場合はパディング
+            padded = torch.zeros((npairs, 3), device=pair_forces.device, dtype=pair_forces.dtype)
+            limit = pair_forces.shape[0]
+            padded[:limit] = pair_forces
+            data.update_pair_forces_gpu(padded)
 
-    def _manage_profiling(self):
-        if not self.config.debug_profile:
-            return
-
-        if self.step == self.config.profile_start_step:
-            logging.info(f"Starting CUDA profiler at step {self.step}")
-            torch.cuda.profiler.start()
-
-        if self.step == self.config.profile_end_step:
-            logging.info(f"Stopping CUDA profiler at step {self.step}")
-            torch.cuda.profiler.stop()
-            logging.info("Profiling complete. Exiting.")
-            sys.exit()
-
-    def compute_descriptors(self, data):
-        pass
-
-    def compute_gradients(self, data):
-        pass
+    def compute_descriptors(self, data): pass
+    def compute_gradients(self, data): pass
