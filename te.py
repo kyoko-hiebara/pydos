@@ -133,45 +133,41 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.initialized = False
         self.step = 0
 
-        # 初期化時に変数をセットするが、失敗しても後のメソッドでリカバリする設計にする
-        self.lammps_species_z = [14, 8, 1]  # Si, O, H
+        # マッパー変数を初期化
         self.type_mapper = None
+        
+        # 以前の lammps_species_z は削除し、直接原子番号マッパーを作ります
+        self._setup_z_mapper(model)
 
-    def _setup_type_mapper(self, model):
-        """LAMMPS Type ID -> MACE Model Index のマッピングを作成"""
-        # まだ変数がなければここで定義（安全策）
-        if not hasattr(self, 'lammps_species_z'):
-            self.lammps_species_z = [14, 8, 1]
-
+    def _setup_z_mapper(self, model):
+        """原子番号(Z) -> MACE Model Index のマッピングを作成"""
+        # MACEモデルが期待する原子番号リスト (例: [1, 8, 14] -> H, O, Si)
         model_z_list = model.atomic_numbers.cpu().numpy().tolist()
         
-        # LAMMPS Type ID は 1-based
-        mapper = torch.full((len(self.lammps_species_z) + 1,), -1, dtype=torch.int64)
+        # 最大の原子番号までカバーできる配列を作成 (Z=118 Og まで余裕を持って120確保)
+        max_z = 120
+        mapper = torch.full((max_z,), -1, dtype=torch.int64)
         
-        logging.info("--- MACE-LAMMPS Type Mapping ---")
-        logging.info(f"Model Z List: {model_z_list}")
-        logging.info(f"LAMMPS Z List: {self.lammps_species_z}")
+        logging.info("--- MACE Atomic Number (Z) Mapping ---")
+        logging.info(f"Model expects indices for Z: {model_z_list}")
         
-        for i, z in enumerate(self.lammps_species_z):
-            lammps_type = i + 1
-            if z in model_z_list:
-                model_idx = model_z_list.index(z)
-                mapper[lammps_type] = model_idx
-                logging.info(f"  Type {lammps_type} (Z={z}) -> Index {model_idx}")
+        for idx, z in enumerate(model_z_list):
+            if z < max_z:
+                mapper[z] = idx
+                logging.info(f"  Element Z={z} ({chemical_symbols[z]}) -> MACE Index {idx}")
             else:
-                logging.warning(f"  Warning: Z={z} not in model!")
+                logging.error(f"  Element Z={z} is too large for the mapper array!")
         
         self.type_mapper = mapper
 
     def _initialize_device(self, data):
-        """デバイス初期化とマッピングの強制セットアップ"""
         using_kokkos = "kokkos" in data.__class__.__module__.lower()
 
         if using_kokkos and not self.config.force_cpu:
             device = torch.as_tensor(data.elems).device
             if device.type == "cpu" and not self.config.allow_cpu:
                 raise ValueError(
-                    "GPU requested but tensor is on CPU. Set MACE_ALLOW_CPU=true."
+                    "GPU requested but tensor is on CPU. Set MACE_ALLOW_CPU=true to allow CPU computation."
                 )
         else:
             device = torch.device("cpu")
@@ -179,16 +175,14 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.device = device
         self.model = self.model.to(device)
 
-        # --- [修正] 強制初期化ブロック ---
-        # __init__ が古いまま実行されていても、ここで必ず type_mapper を作る
+        # __init__ の実行漏れ対策 (Lazy Init)
         if not hasattr(self, 'type_mapper') or self.type_mapper is None:
-            logging.info("Initializing type_mapper inside _initialize_device (Lazy Load)")
-            self._setup_type_mapper(self.model)
-        
-        # デバイス転送
+            logging.info("Lazy initializing Z-mapper...")
+            self._setup_z_mapper(self.model)
+
+        # マッパーをデバイスへ転送
         if self.type_mapper is not None:
             self.type_mapper = self.type_mapper.to(device)
-        # -----------------------------
 
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
@@ -199,6 +193,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         nghosts = ntotal - natoms
         npairs = data.npairs
         
+        # LAMMPSからの生データ (今回は Z-1 が入っていると推測される)
         lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
 
         if not self.initialized:
@@ -227,32 +222,44 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
     def _prepare_batch(self, data, natoms, nghosts, lammps_elems):
         """Prepare the input batch for the MACE model."""
         
-        # --- マッピング適用とデバッグ ---
-        # _initialize_device で必ず作られているはずだが、念のため hasattr チェック
-        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
-             self._initialize_device(data)
-
+        # デバイス移動
         current_elems = lammps_elems.to(self.device)
         
-        # エラー発生時の診断情報を強化
-        if torch.any(current_elems >= len(self.type_mapper)):
-             max_type_found = torch.max(current_elems).item()
-             unique_types = torch.unique(current_elems).tolist()
-             defined_limit = len(self.type_mapper) - 1
-             
+        # --- [修正] マッピングロジック (Z-1 -> Z -> Index) ---
+        # ログから判明: data.elems は "原子番号(Z) - 1" の値が入っている
+        # 0 -> H(1), 7 -> O(8), 13 -> Si(14)
+        
+        # 1. まず Z に戻す
+        z_values = current_elems + 1
+        
+        # 2. 安全策: 範囲チェック
+        if torch.any(z_values >= len(self.type_mapper)):
+             max_z_found = torch.max(z_values).item()
              error_msg = (
                  f"!!! DATA ERROR !!!\n"
-                 f"Found Atom Type ID [{max_type_found}] in LAMMPS data, "
-                 f"but the Python script is configured only for Types 1 to {defined_limit}.\n"
-                 f"Types present in current step: {unique_types}\n"
-                 f"Configured elements (Z): {self.lammps_species_z}\n"
-                 f"Please check your LAMMPS data file to see if there are extra atom types defined."
+                 f"Found Atom Z={max_z_found} (Type value {max_z_found-1}) which is outside supported range.\n"
+                 f"Please check if the data format matches the assumption (val = Z-1)."
              )
              logging.error(error_msg)
              raise ValueError(error_msg)
              
-        mapped_species = self.type_mapper[current_elems]
-        # --------------------
+        # 3. マッピング (Z -> Model Index)
+        mapped_species = self.type_mapper[z_values]
+        
+        # 4. マッピング失敗 (-1) のチェック
+        if torch.any(mapped_species == -1):
+             # どの原子がモデルに含まれていないか特定
+             invalid_mask = (mapped_species == -1)
+             invalid_z = z_values[invalid_mask].unique().tolist()
+             error_msg = (
+                 f"!!! MODEL MISMATCH !!!\n"
+                 f"LAMMPS provided atoms with Z={invalid_z} (Type values {[z-1 for z in invalid_z]}).\n"
+                 f"However, the MACE model only supports Z={self.model.atomic_numbers.tolist()}.\n"
+                 f"These atoms cannot be processed by this model."
+             )
+             logging.error(error_msg)
+             raise ValueError(error_msg)
+        # ----------------------------------------------------
 
         return {
             "vectors": torch.as_tensor(data.rij).to(self.dtype).to(self.device),
@@ -278,8 +285,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         eatoms = torch.as_tensor(data.eatoms)
         
         eatoms.copy_(atom_energies[:natoms].detach())
-        
-        # 警告対策: .item()
         data.energy = torch.sum(atom_energies[:natoms]).item()
         
         data.update_pair_forces_gpu(pair_forces)
