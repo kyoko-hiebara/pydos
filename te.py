@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import ctypes
 from contextlib import contextmanager
 from typing import Dict, Tuple
 
@@ -26,7 +27,6 @@ class MACELammpsConfig:
         self.profile_end_step = int(os.environ.get("MACE_PROFILE_END", "10"))
         self.allow_cpu = self._get_env_bool("MACE_ALLOW_CPU", False)
         self.force_cpu = self._get_env_bool("MACE_FORCE_CPU", False)
-        # 安全策: 属性として確実に定義
         self.device_str = os.environ.get("MACE_DEVICE", "") 
 
     @staticmethod
@@ -93,9 +93,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.element_types = [chemical_symbols[s] for s in model.atomic_numbers]
         self.num_species = len(self.element_types)
         
-        # MACEのカットオフ半径を正しく設定
         self.rcutfac = float(model.r_max)
-        
         self.ndescriptors = 1
         self.nparams = 1
         self.dtype = model.r_max.dtype
@@ -103,12 +101,10 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.initialized = False
         self.step = 0
         
-        # 初期化（消えても良いように後でリカバリする）
         self.type_mapper = None
         self._setup_z_mapper(model)
 
     def _setup_z_mapper(self, model):
-        """原子番号(Z) -> MACE Model Index のマッピングを作成"""
         model_z_list = model.atomic_numbers.cpu().numpy().tolist()
         max_z = 120
         mapper = torch.full((max_z,), -1, dtype=torch.int64)
@@ -118,7 +114,6 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.type_mapper = mapper
 
     def _initialize_device(self, data):
-        # 安全策: Configの属性チェック
         if not hasattr(self, 'config'):
              self.config = MACELammpsConfig()
 
@@ -131,32 +126,71 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         self.device = device
         self.model = self.model.to(device)
 
-        # 【修正】type_mapper が消えている場合の自己修復ブロック
         if not hasattr(self, 'type_mapper') or self.type_mapper is None:
-            logging.info("Recovering type_mapper in _initialize_device...")
             self._setup_z_mapper(self.model)
 
         self.type_mapper = self.type_mapper.to(device)
-        
         logging.info(f"MACE model initialized on device: {device}")
         self.initialized = True
+
+    def _get_all_atom_types(self, data_elems, ntotal):
+        """
+        Memory Hack: LAMMPSから渡されるelemsはLocal原子しか見えていない場合がある。
+        ctypesを使ってメモリ番地から直接 ntotal 分のデータを吸い出す。
+        """
+        # アドレス取得の試行
+        addr = None
+        if hasattr(data_elems, '__array_interface__'):
+             addr = data_elems.__array_interface__['data'][0]
+        elif hasattr(data_elems, 'ctypes'):
+             addr = data_elems.ctypes.data
+        else:
+             # バッファプロトコルからの取得
+             try:
+                 mv = memoryview(data_elems)
+                 # メモリアドレスを取得するためのctypesキャスト
+                 addr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
+             except Exception:
+                 pass
+        
+        if addr is None:
+             raise ValueError("Failed to get memory address of atom types.")
+
+        # LAMMPSの atom types は通常 32bit int (c_int)
+        # NumPy経由で安全に配列化する
+        # ポインタを作成
+        c_int_p = ctypes.POINTER(ctypes.c_int)
+        ptr = ctypes.cast(addr, c_int_p)
+        
+        # NumPy配列としてマッピング (コピーを作成して安全にする)
+        try:
+            full_array = np.ctypeslib.as_array(ptr, shape=(ntotal,))
+            return torch.from_numpy(full_array.copy()).to(torch.int64)
+        except Exception as e:
+            raise ValueError(f"Memory hack failed: {e}")
 
     def compute_forces(self, data):
         natoms = data.nlocal
         ntotal = data.ntotal
         npairs = data.npairs
 
-        # 初期化チェック & 実行
         if not self.initialized:
             self._initialize_device(data)
 
-        # CPUモードなら ntotal 分の原子種が取れる
-        lammps_elems = torch.as_tensor(data.elems, dtype=torch.int64)
+        # 【重要】メモリハックで全原子（Ghost含む）のTypeを取得
+        # data.elemsそのものではなく、そこを起点に ntotal 分読む
+        try:
+            full_atom_types = self._get_all_atom_types(data.elems, ntotal)
+        except ValueError as e:
+            # 万が一失敗したら、data.elemsを信じてみる（サイズチェック付き）
+            logging.warning(f"Memory hack warning: {e}. Falling back to standard read.")
+            full_atom_types = torch.as_tensor(data.elems, dtype=torch.int64)
 
-        if lammps_elems.size(0) < ntotal:
+        # サイズチェック (Shape Mismatch の根本原因)
+        if full_atom_types.size(0) < ntotal:
              raise ValueError(
-                 f"Data Error: Received {lammps_elems.size(0)} atoms, but expected {ntotal} (Local+Ghost). "
-                 "Ensure you are running WITHOUT '-sf kk' (Kokkos mode)."
+                 f"CRITICAL: Atom types array size ({full_atom_types.size(0)}) < ntotal ({ntotal}). "
+                 "MACE cannot calculate ghost atom interactions without ghost types."
              )
 
         self.step += 1
@@ -166,8 +200,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             return
 
         with timer("MACE_Step", enabled=self.config.debug_time):
-            # Batch準備
-            batch = self._prepare_batch(data, natoms, ntotal, lammps_elems)
+            # Batch準備 (full_atom_types を渡す)
+            batch = self._prepare_batch(data, natoms, ntotal, full_atom_types)
             
             # MACE計算
             _, node_energy, pair_forces = self.model(batch)
@@ -175,19 +209,15 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             if self.device.type != "cpu":
                 torch.cuda.synchronize()
 
-            # 書き戻し
+            # LAMMPSへ書き戻し
             self._update_lammps_data(data, node_energy, pair_forces, natoms, npairs)
 
-    def _prepare_batch(self, data, natoms, ntotal, lammps_elems):
+    def _prepare_batch(self, data, natoms, ntotal, full_atom_types):
         """Prepare the input batch for the MACE model."""
-        current_elems = lammps_elems.to(self.device)
-        
-        # 自己修復チェック（念の為）
-        if not hasattr(self, 'type_mapper') or self.type_mapper is None:
-             self._initialize_device(data)
-
-        # マッピング
+        # Type ID (LAMMPS 1-based) -> Z -> Index
+        current_elems = full_atom_types.to(self.device)
         z_values = current_elems + 1
+        
         if torch.any(z_values >= len(self.type_mapper)):
              max_z = torch.max(z_values).item()
              raise ValueError(f"Found undefined atom Z={max_z}")
@@ -196,11 +226,12 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         if torch.any(mapped_species == -1):
              raise ValueError("Found atom Z not in model support list.")
 
+        # 座標とペアリスト
         rij = torch.as_tensor(data.rij).to(self.dtype).to(self.device)
         pair_i = torch.as_tensor(data.pair_i, dtype=torch.int64).to(self.device)
         pair_j = torch.as_tensor(data.pair_j, dtype=torch.int64).to(self.device)
 
-        # 双方向グラフ化
+        # 双方向グラフ化 (Neigh Half -> Full)
         full_pair_i = torch.cat([pair_i, pair_j], dim=0)
         full_pair_j = torch.cat([pair_j, pair_i], dim=0)
         full_rij = torch.cat([rij, -rij], dim=0)
@@ -214,7 +245,8 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
         full_pair_j = full_pair_j[mask]
         full_rij = full_rij[mask]
 
-        # Batchサイズ設定
+        # Batchサイズ: ntotal (788) に設定
+        # これで node_attrs (788) と一致する
         batch_vec = torch.zeros(ntotal, dtype=torch.int64, device=self.device)
 
         return {
@@ -232,7 +264,7 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
             
         eatoms = torch.as_tensor(data.eatoms)
         
-        # エネルギー書き戻し
+        # エネルギー書き戻し (Local原子のみ)
         eatoms.copy_(node_energy[:natoms].detach())
         data.energy = torch.sum(node_energy[:natoms]).item()
         
