@@ -227,15 +227,29 @@ class LAMMPS_MLIAP_MACE(MLIAPUnified):
     def _prepare_batch(self, data, natoms, nghosts, lammps_elems):
         """Prepare the input batch for the MACE model."""
         
-        # --- マッピング適用 ---
+        # --- マッピング適用とデバッグ ---
         # _initialize_device で必ず作られているはずだが、念のため hasattr チェック
         if not hasattr(self, 'type_mapper') or self.type_mapper is None:
              self._initialize_device(data)
 
         current_elems = lammps_elems.to(self.device)
         
+        # エラー発生時の診断情報を強化
         if torch.any(current_elems >= len(self.type_mapper)):
-             raise ValueError("LAMMPS atom type exceeds defined species list size.")
+             max_type_found = torch.max(current_elems).item()
+             unique_types = torch.unique(current_elems).tolist()
+             defined_limit = len(self.type_mapper) - 1
+             
+             error_msg = (
+                 f"!!! DATA ERROR !!!\n"
+                 f"Found Atom Type ID [{max_type_found}] in LAMMPS data, "
+                 f"but the Python script is configured only for Types 1 to {defined_limit}.\n"
+                 f"Types present in current step: {unique_types}\n"
+                 f"Configured elements (Z): {self.lammps_species_z}\n"
+                 f"Please check your LAMMPS data file to see if there are extra atom types defined."
+             )
+             logging.error(error_msg)
+             raise ValueError(error_msg)
              
         mapped_species = self.type_mapper[current_elems]
         # --------------------
